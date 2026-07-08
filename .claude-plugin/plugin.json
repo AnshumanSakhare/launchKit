@@ -1,7 +1,7 @@
 {
   "name": "launch-mcp",
-  "version": "0.2.0",
-  "description": "Analyze a GitHub release and generate a complete launch kit: release notes, changelog, blog post, social media content, and share-card images",
+  "version": "0.3.0",
+  "description": "Analyze a GitHub repo and generate a complete launch kit — each as its own file: analysis, release notes, changelog, blog, and X/Reddit/Hacker News/LinkedIn posts, plus an SVG share card",
   "author": {
     "name": "Educhain"
   },
@@ -10,6 +10,7 @@
     "release",
     "changelog",
     "release-notes",
-    "launch"
+    "launch",
+    "social-media"
   ]
 }

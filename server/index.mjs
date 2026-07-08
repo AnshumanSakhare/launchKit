@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
  * Launch MCP — zero-dependency MCP server (stdio, JSON-RPC 2.0).
- * Analyzes GitHub releases and generates launch content via tools + prompts.
+ * Analyzes a GitHub repository and generates launch content via tools + prompts.
+ * Each launch prompt writes its own Markdown file (analysis, blog, X, Reddit,
+ * Hacker News, LinkedIn, release notes, changelog). The share card is SVG-only
+ * and is returned inline so it never depends on a shared filesystem.
  * Requires Node 18+. Optional: GITHUB_TOKEN env var for rate limits / private repos.
  */
 import { createInterface } from "node:readline";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
-import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // GitHub client
@@ -40,113 +42,9 @@ function parseRepo(input) {
   return { owner: m[1], repo: m[2] };
 }
 
-async function listReleasesApi(owner, repo, limit = 10) {
-  return gh(`/repos/${owner}/${repo}/releases?per_page=${Math.min(limit, 100)}`);
-}
-
-async function getRelease(owner, repo, tag) {
-  if (tag) return gh(`/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tag)}`);
-  return gh(`/repos/${owner}/${repo}/releases/latest`);
-}
-
-async function getPreviousTag(owner, repo, tag) {
-  const releases = await listReleasesApi(owner, repo, 100);
-  const ordered = releases
-    .filter((r) => !r.draft)
-    .sort((a, b) => (b.published_at || "").localeCompare(a.published_at || ""));
-  const idx = ordered.findIndex((r) => r.tag_name === tag);
-  if (idx >= 0 && idx + 1 < ordered.length) return ordered[idx + 1].tag_name;
-  return null;
-}
-
-async function compareTags(owner, repo, base, head) {
-  const data = await gh(
-    `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}?per_page=250`
-  );
-  return data.commits.map((c) => ({
-    sha: c.sha.slice(0, 7),
-    message: (c.commit?.message || "").split("\n")[0],
-    author: c.author?.login ?? c.commit?.author?.name ?? null,
-    url: c.html_url,
-  }));
-}
-
-async function getPullRequest(owner, repo, num) {
-  try {
-    const pr = await gh(`/repos/${owner}/${repo}/pulls/${num}`);
-    return {
-      number: pr.number,
-      title: pr.title,
-      user: pr.user?.login ?? "unknown",
-      labels: (pr.labels || []).map((l) => l.name),
-      url: pr.html_url,
-      body: pr.body ? String(pr.body).slice(0, 1000) : null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function categorize(commits) {
-  const out = { features: [], fixes: [], breaking: [], docs: [], performance: [], other: [] };
-  const byType = {};
-  for (const c of commits) {
-    const msg = c.message;
-    const m = msg.match(/^(\w+)(\([^)]*\))?(!)?:\s*(.*)/);
-    const type = m ? m[1].toLowerCase() : "other";
-    byType[type] = (byType[type] || 0) + 1;
-    const line = `${msg} (${c.sha})`;
-    if ((m && m[3]) || /BREAKING CHANGE/i.test(msg)) out.breaking.push(line);
-    else if (type === "feat") out.features.push(line);
-    else if (type === "fix") out.fixes.push(line);
-    else if (type === "docs") out.docs.push(line);
-    else if (type === "perf") out.performance.push(line);
-    else out.other.push(line);
-  }
-  return { categorized: out, byType };
-}
-
-async function analyzeRelease(repoInput, tag, compareBase) {
-  const { owner, repo } = parseRepo(repoInput);
-  const [repoInfo, release] = await Promise.all([
-    gh(`/repos/${owner}/${repo}`),
-    getRelease(owner, repo, tag),
-  ]);
-  const previousTag = compareBase ?? (await getPreviousTag(owner, repo, release.tag_name));
-  let commits = [];
-  if (previousTag) {
-    try {
-      commits = await compareTags(owner, repo, previousTag, release.tag_name);
-    } catch {}
-  }
-  const prNumbers = [
-    ...new Set(commits.flatMap((c) => [...c.message.matchAll(/#(\d+)/g)].map((m) => parseInt(m[1], 10)))),
-  ].slice(0, 30);
-  const prs = (await Promise.all(prNumbers.map((n) => getPullRequest(owner, repo, n)))).filter(Boolean);
-  const contributors = [...new Set(commits.map((c) => c.author).filter(Boolean))];
-  const { categorized, byType } = categorize(commits);
-  return {
-    repo: repoInfo,
-    release: {
-      tag: release.tag_name,
-      name: release.name || release.tag_name,
-      url: release.html_url,
-      publishedAt: release.published_at,
-      prerelease: release.prerelease,
-      body: release.body,
-      author: release.author?.login ?? null,
-      assets: (release.assets || []).map((a) => ({ name: a.name, downloads: a.download_count })),
-    },
-    previousTag,
-    commits,
-    commitStats: { total: commits.length, byType },
-    pullRequests: prs,
-    contributors,
-    categorized,
-  };
-}
-
-
+// ---------------------------------------------------------------------------
+// Repository analysis (no release required)
+// ---------------------------------------------------------------------------
 async function analyzeRepo(repoInput, includeReadme = true, commitLimit = 30) {
   const { owner, repo } = parseRepo(repoInput);
   const info = await gh(`/repos/${owner}/${repo}`);
@@ -166,7 +64,7 @@ async function analyzeRepo(repoInput, includeReadme = true, commitLimit = 30) {
   L.push(`- **Stats**: ⭐ ${info.stargazers_count} stars, ${info.forks_count} forks, ${info.subscribers_count ?? "?"} watchers, ${info.open_issues_count} open issues`);
   L.push(`- **License**: ${info.license?.spdx_id ?? "none"} — created ${String(info.created_at).slice(0, 10)}, last push ${String(info.pushed_at).slice(0, 10)}`);
   if (info.topics?.length) L.push(`- **Topics**: ${info.topics.join(", ")}`);
-  L.push(`- **Latest release**: ${latestRelease ? `${latestRelease.tag_name} (${String(latestRelease.published_at).slice(0, 10)}) — use analyze_release for details` : "none — this repo does not use GitHub releases"}`);
+  L.push(`- **Latest release**: ${latestRelease ? `${latestRelease.tag_name} (${String(latestRelease.published_at).slice(0, 10)})` : "none — this repo does not use GitHub releases"}`);
   L.push("");
 
   const totalBytes = Object.values(languages).reduce((a, b) => a + b, 0);
@@ -200,46 +98,8 @@ async function analyzeRepo(repoInput, includeReadme = true, commitLimit = 30) {
   return L.join("\n");
 }
 
-function analysisToMarkdown(a) {
-  const L = [];
-  L.push(`# Release analysis: ${a.repo.full_name} ${a.release.tag}`, "");
-  L.push(`- **Release**: [${a.release.name}](${a.release.url})${a.release.prerelease ? " (pre-release)" : ""}`);
-  L.push(`- **Published**: ${a.release.publishedAt ?? "unpublished"}${a.release.author ? ` by @${a.release.author}` : ""}`);
-  L.push(`- **Compared against**: ${a.previousTag ?? "none (first release or no earlier tag found)"}`);
-  L.push(`- **Repo**: ${a.repo.description ?? ""} — ⭐ ${a.repo.stargazers_count}, ${a.repo.language ?? "n/a"}${a.repo.homepage ? `, ${a.repo.homepage}` : ""}`);
-  L.push(`- **Commits in this release**: ${a.commitStats.total}`);
-  L.push(`- **Contributors**: ${a.contributors.length ? a.contributors.map((c) => `@${c}`).join(", ") : "n/a"}`, "");
-  const sections = [
-    ["🚨 Breaking changes", a.categorized.breaking],
-    ["✨ Features", a.categorized.features],
-    ["🐛 Fixes", a.categorized.fixes],
-    ["⚡ Performance", a.categorized.performance],
-    ["📝 Docs", a.categorized.docs],
-    ["🔧 Other", a.categorized.other],
-  ];
-  for (const [title, items] of sections) {
-    if (!items.length) continue;
-    L.push(`## ${title} (${items.length})`, "");
-    for (const item of items.slice(0, 40)) L.push(`- ${item}`);
-    if (items.length > 40) L.push(`- …and ${items.length - 40} more`);
-    L.push("");
-  }
-  if (a.pullRequests.length) {
-    L.push(`## Merged pull requests (${a.pullRequests.length})`, "");
-    for (const pr of a.pullRequests)
-      L.push(`- #${pr.number} ${pr.title} (@${pr.user})${pr.labels.length ? ` [${pr.labels.join(", ")}]` : ""}`);
-    L.push("");
-  }
-  if (a.release.body) L.push(`## Existing release notes on GitHub`, "", a.release.body.slice(0, 4000), "");
-  if (a.release.assets.length) {
-    L.push(`## Assets`, "");
-    for (const asset of a.release.assets) L.push(`- ${asset.name} (${asset.downloads} downloads)`);
-  }
-  return L.join("\n");
-}
-
 // ---------------------------------------------------------------------------
-// Share card (SVG; PNG via ImageMagick if available)
+// Share card (SVG only — returned inline)
 // ---------------------------------------------------------------------------
 const THEMES = {
   dark: { bg: "#0d1117", bg2: "#0d1117", fg: "#f0f6fc", muted: "#8b949e", accent: "#58a6ff" },
@@ -302,49 +162,51 @@ function buildCardSvg(o) {
 </svg>`;
 }
 
-function renderCard(o, outBase) {
-  const svg = buildCardSvg(o);
-  mkdirSync(dirname(outBase), { recursive: true });
-  const svgPath = outBase + ".svg";
-  writeFileSync(svgPath, svg, "utf8");
-  let pngPath = null;
-  for (const bin of ["magick", "convert", "rsvg-convert"]) {
-    try {
-      const target = outBase + ".png";
-      if (bin === "rsvg-convert") execFileSync(bin, ["-o", target, svgPath], { stdio: "ignore" });
-      else execFileSync(bin, [svgPath, target], { stdio: "ignore" });
-      pngPath = target;
-      break;
-    } catch {}
+// ---------------------------------------------------------------------------
+// Bundled skills — expert writing playbooks shipped with the plugin.
+// The server injects the relevant SKILL.md into the matching prompt so the
+// content is generated using the skill automatically, no separate install.
+// ---------------------------------------------------------------------------
+const SKILLS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+const _skillCache = new Map();
+
+// Read a bundled skill's SKILL.md, strip YAML frontmatter, cache the body.
+function loadSkill(name) {
+  if (_skillCache.has(name)) return _skillCache.get(name);
+  let body = "";
+  try {
+    const raw = readFileSync(join(SKILLS_DIR, name, "SKILL.md"), "utf8");
+    body = raw.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+  } catch {
+    body = "";
   }
-  return { svgPath, pngPath };
+  _skillCache.set(name, body);
+  return body;
+}
+
+// Render the "apply this skill" block appended to a prompt.
+function skillBlock(name) {
+  const body = loadSkill(name);
+  if (!body) return "";
+  return (
+    `\n\n---\n\nApply the bundled **${name}** skill below when writing this content. ` +
+    `Follow its guidance directly; deeper reference material lives in ` +
+    `\`${join(SKILLS_DIR, name, "references")}\` if you need it.\n\n` +
+    `<skill name="${name}">\n${body}\n</skill>`
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Tool & prompt definitions
 // ---------------------------------------------------------------------------
 const REPO_DESC = 'GitHub repository as "owner/repo" or a full GitHub URL';
-const TAG_DESC = "Release tag (e.g. v1.2.0). Omit for the latest release";
+const DIR_DESC = "Directory where the launch files should be written (defaults to the current working directory)";
 
 const TOOLS = [
   {
-    name: "analyze_release",
-    description:
-      "Analyze a GitHub release: metadata, commits since the previous release (categorized by conventional-commit type), merged PRs, contributors, and existing notes. Run this first — its output is the source material for all content generation.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        repo: { type: "string", description: REPO_DESC },
-        tag: { type: "string", description: TAG_DESC },
-        compare_base: { type: "string", description: "Override the tag to diff against (defaults to the previous published release)" },
-      },
-      required: ["repo"],
-    },
-  },
-  {
     name: "analyze_repo",
     description:
-      "Analyze a GitHub repository as a whole — no release required: metadata, stars/forks, languages, topics, top contributors, recent commit activity, tags, and README excerpt. Use this when the repo has no releases, or for project-level (rather than release-level) launch content.",
+      "Analyze a GitHub repository: metadata, stars/forks, languages, topics, top contributors, recent commit activity, tags, and README excerpt. Run this first — its Markdown output is the source material for every launch prompt.",
     inputSchema: {
       type: "object",
       properties: {
@@ -356,66 +218,102 @@ const TOOLS = [
     },
   },
   {
-    name: "list_releases",
-    description: "List recent releases of a GitHub repository (tag, name, date, prerelease flag).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        repo: { type: "string", description: REPO_DESC },
-        limit: { type: "integer", minimum: 1, maximum: 100, description: "Max releases to return (default 10)" },
-      },
-      required: ["repo"],
-    },
-  },
-  {
     name: "generate_share_card",
     description:
-      "Generate a 1200x630 social share-card image (SVG, plus PNG when an SVG rasterizer is installed) announcing a release. Provide a short title and up to 4 highlight bullets — typically distilled from analyze_release output. Returns file paths.",
+      "Generate a 1200x630 social share-card as SVG announcing a project or release. Provide a short title and up to 4 highlight bullets — typically distilled from analyze_repo output. Returns the SVG markup inline (save it as share-card.svg); optionally also writes it to output_dir.",
     inputSchema: {
       type: "object",
       properties: {
         repo: { type: "string", description: REPO_DESC },
-        version: { type: "string", description: "Version label shown on the card, e.g. v2.1.0" },
+        version: { type: "string", description: "Version or label shown on the card, e.g. v2.1.0" },
         title: { type: "string", description: "Headline (max ~46 chars shown)" },
         highlights: { type: "array", items: { type: "string" }, maxItems: 4, description: "Up to 4 short highlight bullets" },
-        stars: { type: "integer", description: "Star count badge (from analyze_release)" },
+        stars: { type: "integer", description: "Star count badge (from analyze_repo)" },
         theme: { type: "string", enum: ["dark", "light", "gradient"], description: "Card theme (default gradient)" },
         accent_color: { type: "string", description: "Accent hex color, e.g. #8b7cf8" },
-        output_dir: { type: "string", description: "Directory to write the image (defaults to a temp dir)" },
+        output_dir: { type: "string", description: "Optional directory to also write the .svg file (the SVG is always returned inline regardless)" },
       },
       required: ["repo", "version"],
     },
   },
 ];
 
-const PROMPT_INSTRUCTIONS = {
-  "release-notes":
-    "Write polished release notes in Markdown. Structure: a 2-3 sentence overview of the release theme; sections for Breaking Changes (with migration guidance), New Features, Bug Fixes, and Other Improvements (omit empty sections); a Contributors thank-you list. Tone: clear, professional, developer-facing. Rewrite raw commit messages into user-benefit language.",
-  changelog:
-    'Produce a changelog entry following the Keep a Changelog format (https://keepachangelog.com): a "## [version] - YYYY-MM-DD" heading, then "### Added / Changed / Deprecated / Removed / Fixed / Security" subsections as applicable. Terse, one line per change, imperative mood, reference PR numbers like (#123).',
-  "blog-post":
-    "Write a launch blog post (500-800 words) in Markdown. Open with a hook about the problem this release solves, walk through the 2-4 most significant changes with concrete usage examples where the data supports them, mention notable fixes briefly, close with upgrade instructions and a link to the full release. Tone: enthusiastic but substantive. Include a suggested title and 3 alternative titles at the top.",
-  "twitter-thread":
-    'Write a Twitter/X thread (3-6 tweets, each under 280 characters). Tweet 1: the announcement with the single most exciting change and the release link. Middle tweets: one key feature or fix each, concrete and specific. Final tweet: call to action and thanks to contributors. Number the tweets "1/", "2/", etc. Minimal hashtags (max 2 total), no emoji spam.',
-  "linkedin-post":
-    "Write a LinkedIn post (120-200 words). Professional but warm tone. Lead with the impact of the release, summarize 2-3 headline improvements in plain language a non-user could follow, credit the contributor community, end with a link to the release and a question inviting engagement. No hashtag walls (max 3).",
-  "full-launch-kit":
-    "Produce a complete launch kit as a single Markdown document with these sections: 1) Release Notes (polished, sectioned by change type, contributor thanks); 2) Changelog entry (Keep a Changelog format); 3) Blog Post (500-800 words with title options); 4) Twitter/X Thread (3-6 numbered tweets under 280 chars); 5) LinkedIn Post (120-200 words). Then call the generate_share_card tool with a punchy title and the top 3-4 highlights to create the announcement image, and report the file paths.",
+// Each prompt owns one output file. `analysis` saves the raw analyze_repo
+// output; the rest transform it into channel-specific content.
+const TASKS = {
+  analysis: {
+    file: "analysis.md",
+    description: "Save the raw repository analysis",
+    instructions:
+      "Save the analyze_repo Markdown output verbatim (this is the shared source material for the other launch files). Do not rewrite or summarize it.",
+  },
+  "release-notes": {
+    file: "release-notes.md",
+    description: "Write polished release notes",
+    instructions:
+      "Write polished release notes in Markdown. Structure: a 2-3 sentence overview of what the project/release is about; sections for New Features, Improvements, Bug Fixes, and Breaking Changes with migration guidance (omit empty sections); a Contributors thank-you list. Tone: clear, professional, developer-facing. Rewrite raw commit messages into user-benefit language.",
+  },
+  changelog: {
+    file: "changelog.md",
+    description: "Generate a Keep-a-Changelog entry",
+    instructions:
+      'Produce a changelog entry following the Keep a Changelog format (https://keepachangelog.com): a "## [version] - YYYY-MM-DD" heading, then "### Added / Changed / Deprecated / Removed / Fixed / Security" subsections as applicable. Terse, one line per change, imperative mood, reference PR numbers like (#123) only when present in the analysis.',
+  },
+  "blog-post": {
+    file: "blog.md",
+    description: "Write a launch blog post",
+    instructions:
+      "Write a launch blog post (500-800 words) in Markdown. Open with a hook about the problem this project solves, walk through the 2-4 most significant capabilities with concrete usage examples where the data supports them, mention notable fixes briefly, close with getting-started/upgrade instructions and a link to the repo. Tone: enthusiastic but substantive. Include a suggested title and 3 alternative titles at the top.",
+  },
+  x: {
+    file: "x.md",
+    description: "Write an X / Twitter thread",
+    skill: "x-algo-tweet-writer",
+    instructions:
+      'Write an X (Twitter) post/thread announcing the project. Tweet 1: the announcement with the single most exciting point and the repo link. Middle tweets: one key feature or fix each, concrete and specific. Final tweet: call to action and thanks to contributors. Number the tweets "1/", "2/", etc. Minimal hashtags (max 2 total), no emoji spam. Also include the launch plan the skill specifies.',
+  },
+  reddit: {
+    file: "reddit.md",
+    description: "Write a Reddit post",
+    instructions:
+      "Write a Reddit post. First line: a suggested title (plain, non-clickbait, no emoji). Then a 150-300 word body in the honest, conversational tone Reddit rewards: what the project is, why you built it, how it compares to alternatives, and an explicit invitation for feedback. Suggest 1-2 relevant subreddits at the very top as a comment line. Avoid marketing language and hashtags.",
+  },
+  hackernews: {
+    file: "hackernews.md",
+    description: "Write a Show HN post",
+    instructions:
+      'Write a "Show HN" submission. First line: the title in the form "Show HN: <project> – <concise description>" (under 80 chars, no hype). Then a first-comment body (100-200 words) explaining what it does, the technical approach, what is genuinely novel, current limitations, and what feedback you are looking for. Plain text, no markdown headers, no emoji, no marketing adjectives — HN readers are technical and skeptical.',
+  },
+  linkedin: {
+    file: "linkedin.md",
+    description: "Write a LinkedIn post",
+    skill: "writing-linkedin-posts",
+    instructions:
+      "Write a LinkedIn post (120-200 words). Professional but warm tone. Lead with the impact of the project, summarize 2-3 headline points in plain language a non-user could follow, credit the contributor community, end with a link to the repo and a question inviting engagement. No hashtag walls (max 3).",
+  },
 };
 
-const PROMPTS = Object.entries({
-  "release-notes": "Write polished release notes for a GitHub release",
-  changelog: "Generate a Keep-a-Changelog style changelog entry",
-  "blog-post": "Write a launch blog post announcing the release",
-  "twitter-thread": "Write a Twitter/X thread announcing the release",
-  "linkedin-post": "Write a LinkedIn post announcing the release",
-  "full-launch-kit": "Generate the complete launch kit: release notes, changelog, blog post, social posts, and a share card",
-}).map(([name, description]) => ({
+// full-launch-kit orchestrates every task above plus the share card.
+const FULL_KIT = {
+  description: "Generate the complete launch kit: analysis, release notes, changelog, blog, and X/Reddit/HN/LinkedIn posts, each as its own file, plus a share card",
+  instructions:
+    "Produce the complete launch kit, writing EACH deliverable as its own file in the output directory:\n" +
+    Object.entries(TASKS)
+      .map(([, t]) => `- ${t.file}: ${t.description.toLowerCase()}`)
+      .join("\n") +
+    "\nFollow the per-channel guidance from the individual prompts for each file. " +
+    "For x.md apply the bundled x-algo-tweet-writer skill, and for linkedin.md apply the bundled writing-linkedin-posts skill (both included below). " +
+    "Then call the generate_share_card tool with a punchy title and the top 3-4 highlights, and save the returned SVG markup as share-card.svg in the same directory.",
+};
+
+const ALL_PROMPTS = { ...TASKS, "full-launch-kit": FULL_KIT };
+
+const PROMPTS = Object.entries(ALL_PROMPTS).map(([name, t]) => ({
   name,
-  description,
+  description: t.description,
   arguments: [
     { name: "repo", description: REPO_DESC, required: true },
-    { name: "tag", description: TAG_DESC, required: false },
+    { name: "output_dir", description: DIR_DESC, required: false },
   ],
 }));
 
@@ -423,61 +321,66 @@ const PROMPTS = Object.entries({
 // Tool handlers
 // ---------------------------------------------------------------------------
 async function callTool(name, args = {}) {
-  if (name === "analyze_release") {
-    const a = await analyzeRelease(args.repo, args.tag, args.compare_base);
-    return analysisToMarkdown(a);
-  }
   if (name === "analyze_repo") {
     return analyzeRepo(args.repo, args.include_readme !== false, args.commit_limit ?? 30);
-  }
-  if (name === "list_releases") {
-    const { owner, repo } = parseRepo(args.repo);
-    const releases = await listReleasesApi(owner, repo, args.limit ?? 10);
-    return (
-      releases
-        .map(
-          (r) =>
-            `- ${r.tag_name}${r.name && r.name !== r.tag_name ? ` — ${r.name}` : ""} (${
-              r.published_at?.slice(0, 10) ?? "draft"
-            })${r.prerelease ? " [prerelease]" : ""}`
-        )
-        .join("\n") || "No releases found."
-    );
   }
   if (name === "generate_share_card") {
     const { owner, repo } = parseRepo(args.repo);
     if (!args.version) throw new Error("version is required");
-    const dir = args.output_dir ?? join(tmpdir(), "launch-mcp");
-    const base = join(dir, `${repo}-${String(args.version).replace(/[^\w.-]/g, "_")}-card`);
-    const { svgPath, pngPath } = renderCard(
-      {
-        repoName: `${owner}/${repo}`,
-        version: args.version,
-        title: args.title,
-        highlights: args.highlights,
-        stars: args.stars,
-        theme: args.theme,
-        accentColor: args.accent_color,
-      },
-      base
+    const svg = buildCardSvg({
+      repoName: `${owner}/${repo}`,
+      version: args.version,
+      title: args.title,
+      highlights: args.highlights,
+      stars: args.stars,
+      theme: args.theme,
+      accentColor: args.accent_color,
+    });
+    let written = "";
+    if (args.output_dir) {
+      const path = join(args.output_dir, `${repo}-${String(args.version).replace(/[^\w.-]/g, "_")}-card.svg`);
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, svg, "utf8");
+        written = `\n\n(Also written to ${path})`;
+      } catch (e) {
+        written = `\n\n(Could not write to output_dir: ${e.message} — use the inline SVG above.)`;
+      }
+    }
+    return (
+      "Share card (SVG). Save the markup below as `share-card.svg`:\n\n" +
+      "```svg\n" +
+      svg +
+      "\n```" +
+      written
     );
-    return pngPath
-      ? `Share card written:\n- PNG: ${pngPath}\n- SVG: ${svgPath}`
-      : `Share card written (SVG only — no PNG rasterizer found on this system):\n- SVG: ${svgPath}`;
   }
   throw new Error(`Unknown tool: ${name}`);
 }
 
 function getPrompt(name, args = {}) {
-  const instructions = PROMPT_INSTRUCTIONS[name];
-  if (!instructions) throw new Error(`Unknown prompt: ${name}`);
+  const task = ALL_PROMPTS[name];
+  if (!task) throw new Error(`Unknown prompt: ${name}`);
   if (!args.repo) throw new Error("repo argument is required");
+  const dir = args.output_dir || "the current working directory";
+  const fileLine =
+    name === "full-launch-kit"
+      ? `Write each file into ${dir}.`
+      : `Save the result as \`${task.file}\` in ${dir}.`;
+  let skills = "";
+  if (name === "full-launch-kit") {
+    // Kit writes both x.md and linkedin.md — attach both skills.
+    skills = skillBlock("x-algo-tweet-writer") + skillBlock("writing-linkedin-posts");
+  } else if (task.skill) {
+    skills = skillBlock(task.skill);
+  }
   const text =
-    `First call the launch-mcp tool \`analyze_release\` with repo="${args.repo}"` +
-    (args.tag ? ` and tag="${args.tag}"` : " (latest release)") +
-    `. If that fails because the repo has no releases, call \`analyze_repo\` instead and adapt the task to a project-level launch. Then use the output to complete this task:\n\n${instructions}\n\n` +
+    `First call the launch-mcp tool \`analyze_repo\` with repo="${args.repo}". ` +
+    `Then use its output to complete this task:\n\n${task.instructions}\n\n` +
+    `${fileLine}\n\n` +
     `Ground every claim in the analysis data. Do not invent features, numbers, or quotes. ` +
-    `Link to the release URL where appropriate.`;
+    `Link to the repository URL where appropriate.` +
+    skills;
   return { messages: [{ role: "user", content: { type: "text", text } }] };
 }
 
@@ -496,7 +399,7 @@ async function handle(req) {
         return reply(id, {
           protocolVersion: params.protocolVersion || "2024-11-05",
           capabilities: { tools: {}, prompts: {} },
-          serverInfo: { name: "launch-mcp", version: "0.2.0" },
+          serverInfo: { name: "launch-mcp", version: "0.3.0" },
         });
       case "ping":
         return reply(id, {});
