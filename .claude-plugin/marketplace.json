@@ -1,0 +1,19 @@
+{
+  "name": "buildfastwithai-plugins",
+  "owner": {
+    "name": "Educhain",
+    "email": "educhain-ai@buildfastwithai.com"
+  },
+  "description": "Plugins by BuildFastWithAI",
+  "plugins": [
+    {
+      "name": "launch-mcp",
+      "source": "./",
+      "description": "Analyze a GitHub release or repo and generate a complete launch kit: release notes, changelog, blog post, social media content, and share-card images",
+      "author": { "name": "Educhain" },
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": ["github", "release", "changelog", "release-notes", "launch", "social-media"]
+    }
+  ]
+}
